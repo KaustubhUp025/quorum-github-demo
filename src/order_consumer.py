@@ -57,6 +57,9 @@ def process_message(msg: dict, raw_bytes: bytes = b"") -> None:
 
     log.error("all retries exhausted", extra={"order_id": order_id})
     # RULE_12: message silently dropped — no DLQ, no alerting, no recovery path.
+    if dlq_producer:
+        log.info("sending to DLQ", extra={"order_id": order_id, "topic": KAFKA_DLQ_TOPIC})
+        dlq_producer.send(KAFKA_DLQ_TOPIC, value=raw_bytes)
 
 
 def run() -> None:
