@@ -11,12 +11,14 @@ Intentional anti-patterns present (for demo purposes):
 import time
 import logging
 import requests
-from kafka import KafkaConsumer
+import json
+from kafka import KafkaConsumer, KafkaProducer
 
 log = logging.getLogger(__name__)
 
 PAYMENT_GATEWAY_URL = "https://api.payments.internal/v1/confirm"
 KAFKA_TOPIC = "order.payment.events"
+KAFKA_DLQ_TOPIC = "order.payment.dlq"
 KAFKA_BOOTSTRAP = "kafka:9092"
 KAFKA_GROUP = "order-service"
 
@@ -35,9 +37,10 @@ def confirm_payment(order_id: str, amount: float) -> dict:
     return response.json()
 
 
-def process_message(msg: dict) -> None:
+def process_message(msg: dict, producer: KafkaProducer) -> None:
     order_id = msg["order_id"]
     amount = msg["amount"]
+    last_exc = None
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -45,14 +48,21 @@ def process_message(msg: dict) -> None:
             log.info("payment confirmed", extra={"order_id": order_id, "result": result})
             return
         except Exception as exc:
+            last_exc = exc
             log.warning("payment attempt failed", extra={"attempt": attempt, "error": str(exc)})
             # RULE_06: fixed delay — all retrying consumers wake at the same time,
             # hammering the recovering gateway simultaneously (thundering herd).
             time.sleep(RETRY_DELAY)
 
     log.error("payment failed after all retries", extra={"order_id": order_id})
-    # RULE_12: no DLQ — failed messages are silently dropped.
-    # A poison-pill order will be lost with no recovery path.
+    # FIX: Send to DLQ
+    dlq_payload = {
+        "original_message": msg,
+        "failure_reason": str(last_exc),
+        "failed_at": time.time(),
+    }
+    producer.send(KAFKA_DLQ_TOPIC, value=json.dumps(dlq_payload).encode("utf-8"))
+    log.info("message sent to DLQ", extra={"order_id": order_id, "topic": KAFKA_DLQ_TOPIC})
 
 
 def run() -> None:
@@ -62,12 +72,14 @@ def run() -> None:
         group_id=KAFKA_GROUP,
         auto_offset_reset="earliest",
         enable_auto_commit=True,
+        value_deserializer=lambda m: json.loads(m.decode('utf-8')),
     )
+    producer = KafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP)
     log.info("consumer started", extra={"topic": KAFKA_TOPIC})
 
     for record in consumer:
         try:
-            process_message(record.value)
+            process_message(record.value, producer)
         except Exception as exc:
-            # RULE_12: exception swallowed — no DLQ, no alerting.
+            # This outer block is a last resort. The DLQ is handled in process_message.
             log.error("unhandled error processing record", extra={"error": str(exc)})
