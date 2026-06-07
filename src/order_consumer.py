@@ -11,12 +11,14 @@ Intentional anti-patterns present (for demo purposes):
 import time
 import logging
 import requests
-from kafka import KafkaConsumer
+import json
+from kafka import KafkaConsumer, KafkaProducer
 
 log = logging.getLogger(__name__)
 
 PAYMENT_GATEWAY_URL = "https://api.payments.internal/v1/confirm"
 KAFKA_TOPIC = "order.payment.events"
+KAFKA_DLQ_TOPIC = "order.payment.dlq"
 KAFKA_BOOTSTRAP = "kafka:9092"
 KAFKA_GROUP = "order-service"
 
@@ -35,7 +37,7 @@ def confirm_payment(order_id: str, amount: float) -> dict:
     return response.json()
 
 
-def process_message(msg: dict) -> None:
+def process_message(producer: KafkaProducer, original_value: bytes, msg: dict) -> None:
     order_id = msg["order_id"]
     amount = msg["amount"]
 
@@ -50,9 +52,9 @@ def process_message(msg: dict) -> None:
             # hammering the recovering gateway simultaneously (thundering herd).
             time.sleep(RETRY_DELAY)
 
-    log.error("payment failed after all retries", extra={"order_id": order_id})
-    # RULE_12: no DLQ — failed messages are silently dropped.
-    # A poison-pill order will be lost with no recovery path.
+    log.error("payment failed after all retries, sending to DLQ", extra={"order_id": order_id})
+    # FIX: Send the failed message to a dead-letter queue (DLQ) for later inspection.
+    producer.send(KAFKA_DLQ_TOPIC, value=original_value)
 
 
 def run() -> None:
@@ -63,11 +65,15 @@ def run() -> None:
         auto_offset_reset="earliest",
         enable_auto_commit=True,
     )
+    producer = KafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP)
     log.info("consumer started", extra={"topic": KAFKA_TOPIC})
 
     for record in consumer:
         try:
-            process_message(record.value)
+            # Assuming JSON-encoded messages
+            msg_value = json.loads(record.value.decode('utf-8'))
+            process_message(producer, record.value, msg_value)
         except Exception as exc:
-            # RULE_12: exception swallowed — no DLQ, no alerting.
+            # Unhandled errors (e.g., JSON parsing) are still logged,
+            # but processing failures are now handled with a DLQ.
             log.error("unhandled error processing record", extra={"error": str(exc)})
