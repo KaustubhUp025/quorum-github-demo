@@ -1,4 +1,5 @@
-"""Basic smoke tests — CI passes even with buggy production code."""
+"""Smoke tests for the order payment consumer."""
+import json as _json
 from unittest.mock import patch, MagicMock
 from src.order_consumer import process_message
 
